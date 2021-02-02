@@ -1,0 +1,6 @@
+__pycache__/
+venv/
+kubernetes/
+Dockerfile
+settings.yaml
+README.md
