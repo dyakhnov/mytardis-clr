@@ -6,14 +6,19 @@ import yaml
 from psycopg2 import connect, sql
 from psycopg2.extras import RealDictCursor
 
+# DROP TABLE cleanup;
 # CREATE TABLE cleanup (
-# 	id SERIAL,
-# 	storage_box_id INTEGER NOT NULL,
-#   file_size BIGINT NOT NULL,
-# 	uri TEXT NOT NULL,
-# 	PRIMARY KEY (id)
+#     id SERIAL,
+#     storage_box_id INTEGER NOT NULL,
+#     file_size BIGINT NOT NULL,
+#     uri TEXT NOT NULL,
+#     PRIMARY KEY (id)
 # );
-# CREATE INDEX cleanup_storage_box_id ON cleanup (storage_box_id);
+# CREATE UNIQUE INDEX cleanup_uq ON cleanup (storage_box_id, uri);
+# GRANT ALL PRIVILEGES ON TABLE cleanup TO mytardis;
+# GRANT USAGE, SELECT ON SEQUENCE cleanup_id_seq TO mytardis;
+
+cache = []
 
 
 def get_parser():
@@ -35,43 +40,72 @@ def get_parser():
     return parser
 
 
+def get_dataset_id(sbid, path):
+    q = sql.SQL("""
+        SELECT DISTINCT df.dataset_id 
+        FROM tardis_portal_datafileobject AS dfo
+        LEFT JOIN tardis_portal_datafile AS df
+        ON df.id=dfo.datafile_id 
+        WHERE dfo.storage_box_id={sbid} AND dfo.uri LIKE {path}
+    """).format(
+        sbid=sql.Literal(sbid),
+        path=sql.Literal("{}%".format(path)))
+    cur.execute(q)
+    rows = cur.fetchall()
+    if len(rows) == 1:
+        return rows[0]["dataset_id"]
+    return None
+
+
+def get_dataset_uris(dsid):
+    q = sql.SQL("""
+        SELECT dfo.uri
+        FROM tardis_portal_datafileobject AS dfo
+        LEFT JOIN tardis_portal_datafile AS df
+        ON df.id=dfo.datafile_id 
+        WHERE df.dataset_id={dsid}
+    """).format(
+        dsid=sql.Literal(dsid))
+    cur.execute(q)
+    data = []
+    for row in cur.fetchall():
+        data.append(row["uri"])
+    return data
+
+
 def walk_the_line(sbid, location, uri):
+    global cache
     this_location = os.path.join(location, uri)
+    if len(uri) == 0:
+        print(this_location)
+    if len(uri) != 0:
+        path = uri.split("/")
+        if len(path) == 1:
+            print(this_location)
+            dsid = get_dataset_id(sbid, path[0])
+            if not dsid:
+                print("Can't find dataset.")
+                return False
+            cache = get_dataset_uris(dsid)
     for fname in os.listdir(this_location):
         fname_abs = os.path.join(this_location, fname)
         fname_uri = os.path.join(uri, fname)
         if os.path.isfile(fname_abs):
-            q = sql.SQL("""
-                SELECT id
-                FROM tardis_portal_datafileobject
-                WHERE storage_box_id={sbid} AND uri={uri}
-                LIMIT 1
-            """).format(sbid=sql.Literal(sbid), uri=sql.Literal(fname_uri))
-            cur.execute(q)
-            dfo = cur.fetchone()
-            if dfo is None:
+            if fname_uri not in cache:
+                fsize = os.stat(fname_abs).st_size
                 q = sql.SQL("""
-                    SELECT id
-                    FROM cleanup
-                    WHERE storage_box_id={sbid} AND uri={uri}
-                    LIMIT 1
-                """).format(sbid=sql.Literal(sbid), uri=sql.Literal(fname_uri))
+                    INSERT INTO cleanup (storage_box_id, file_size, uri)
+                    VALUES ({sbid}, {fsize}, {uri})
+                    ON CONFLICT DO NOTHING
+                """).format(
+                    sbid=sql.Literal(sbid),
+                    fsize=sql.Literal(fsize),
+                    uri=sql.Literal(fname_uri))
                 cur.execute(q)
-                id = cur.fetchone()
-                if id is None:
-                    fsize = os.stat(fname_abs).st_size
-                    q = sql.SQL("""
-                        INSERT INTO cleanup (storage_box_id, file_size, uri)
-                        VALUES ({sbid}, {fsize}, {uri})
-                    """).format(
-                        sbid=sql.Literal(sbid),
-                        fsize=sql.Literal(fsize),
-                        uri=sql.Literal(fname_uri))
-                    cur.execute(q)
-                    con.commit()
-                    print(fsize, fname_abs)
+                con.commit()
         elif os.path.isdir(fname_abs):
             walk_the_line(sbid, location, fname_uri)
+    return True
 
 
 args = get_parser().parse_args()
