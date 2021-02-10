@@ -18,42 +18,37 @@ from psycopg2.extras import RealDictCursor
 # GRANT ALL PRIVILEGES ON TABLE cleanup TO mytardis;
 # GRANT USAGE, SELECT ON SEQUENCE cleanup_id_seq TO mytardis;
 
+sbid = 0
 cache = []
 
 
 def get_parser():
-
     parser = argparse.ArgumentParser()
-
     parser.add_argument(
         "--config",
         default="settings.yaml",
         help="Config file location (default: settings.yaml)."
     )
-
-    parser.add_argument(
-        "location",
-        metavar="location",
-        help="Location value of storage box to scan."
-    )
-
     return parser
 
 
-def get_dataset_id(sbid, path):
+def get_info(sbids, path):
     q = sql.SQL("""
-        SELECT DISTINCT df.dataset_id 
+        SELECT DISTINCT dfo.storage_box_id, df.dataset_id 
         FROM tardis_portal_datafileobject AS dfo
         LEFT JOIN tardis_portal_datafile AS df
         ON df.id=dfo.datafile_id 
-        WHERE dfo.storage_box_id={sbid} AND dfo.uri LIKE {path}
+        WHERE dfo.storage_box_id IN {sbids} AND dfo.uri LIKE {path}
     """).format(
-        sbid=sql.Literal(sbid),
+        sbids=sql.Literal(tuple(sbids)),
         path=sql.Literal("{}%".format(path)))
     cur.execute(q)
     rows = cur.fetchall()
     if len(rows) == 1:
-        return rows[0]["dataset_id"]
+        return {
+            "sbid": rows[0]["storage_box_id"],
+            "dsid": rows[0]["dataset_id"]
+        }
     return None
 
 
@@ -73,7 +68,27 @@ def get_dataset_uris(dsid):
     return data
 
 
-def walk_the_line(sbid, location, uri):
+def get_storage_boxes():
+    q = sql.SQL("""
+        SELECT sb.name, sbo.value AS location
+        FROM tardis_portal_storagebox AS sb
+        JOIN tardis_portal_storageboxoption AS sbo
+        ON sbo.storage_box_id = sb.id AND sbo.key = 'location'
+        WHERE
+            sb.status != 'deleted' AND
+            sb.master_box_id IS NULL AND
+            sb.name NOT LIKE 'fast%' AND
+            sb.name NOT LIKE '%test%' AND
+            sb.name NOT LIKE '%temp%' AND
+            sb.name NOT LIKE '%vault%' AND
+            sbo.value NOT LIKE '%vault%'
+    """)
+    cur.execute(q)
+    return cur.fetchall()
+
+
+def walk_the_line(sbids, location, uri):
+    global sbid
     global cache
     this_location = os.path.join(location, uri)
     if len(uri) == 0:
@@ -82,11 +97,12 @@ def walk_the_line(sbid, location, uri):
         path = uri.split("/")
         if len(path) == 1:
             print(this_location)
-            dsid = get_dataset_id(sbid, path[0])
-            if not dsid:
+            info = get_info(sbids, path[0])
+            if not info:
                 print("Can't find dataset.")
                 return False
-            cache = get_dataset_uris(dsid)
+            sbid = info["sbid"]
+            cache = get_dataset_uris(info["dsid"])
     for fname in os.listdir(this_location):
         fname_abs = os.path.join(this_location, fname)
         fname_uri = os.path.join(uri, fname)
@@ -104,7 +120,7 @@ def walk_the_line(sbid, location, uri):
                 cur.execute(q)
                 con.commit()
         elif os.path.isdir(fname_abs):
-            walk_the_line(sbid, location, fname_uri)
+            walk_the_line(sbids, location, fname_uri)
     return True
 
 
@@ -129,23 +145,26 @@ except Exception as e:
 
 cur = con.cursor(cursor_factory=RealDictCursor)
 
-q = sql.SQL("""
-    SELECT storage_box_id
-    FROM tardis_portal_storageboxoption
-    WHERE key='location' AND value={location}
-""").format(location=sql.Literal(args.location))
-cur.execute(q)
-rows = cur.fetchall()
+sbs = get_storage_boxes()
+for sb in sbs:
+    print("Scanning {}".format(sb["name"]))
+    q = sql.SQL("""
+        SELECT storage_box_id
+        FROM tardis_portal_storageboxoption
+        WHERE key='location' AND value={location}
+    """).format(location=sql.Literal(sb["location"]))
+    cur.execute(q)
+    rows = cur.fetchall()
 
-if len(rows) == 1:
-    try:
-        print("Walking {}".format(args.location))
-        walk_the_line(rows[0]["storage_box_id"], args.location, "")
-        print("Completed.")
-    except Exception as e:
-        print("Error - {}.".format(str(e)))
-else:
-    print("Can't find storage box.")
+    if len(rows) != 0:
+        try:
+            print("Walking {}".format(sb["location"]))
+            walk_the_line([row["storage_box_id"] for row in rows], sb["location"], "")
+            print("Completed.")
+        except Exception as e:
+            print("Error - {}.".format(str(e)))
+    else:
+        print("Can't find storage boxes for this location.")
 
 cur.close()
 con.close()
